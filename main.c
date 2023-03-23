@@ -1,3 +1,17 @@
+/* 
+	Authors - Rajdeep Pinge, Aditya Joglekar
+	March-April, 2017
+*/
+
+
+/* Code Reference:
+	Basic code given by University of Notre Dame for project on virtual memory in their cse30341 operating systems course.
+
+	link to the project description: http://www3.nd.edu/~dthain/courses/cse30341/spring2017/project5/
+	link to the source code: http://www3.nd.edu/~dthain/courses/cse30341/spring2017/project5/source/
+*/
+
+
 /*
 Main program for the virtual memory project.
 Make all of your modifications to this file.
@@ -6,440 +20,692 @@ The header files page_table.h and disk.h explain
 how to use the page table and disk interfaces.
 */
 
+
 #include "page_table.h"
 #include "disk.h"
-#include "program.h"
-// #include "page_table.c"
+#include "time.h"
+
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <errno.h>
 
-#define UNUSED_FRAME -1
 
-int disk_read_count = 0;
-int disk_write_count = 0;
-int page_faults_count = 0;
-int page_count = 0;
 
-struct frame_table
+// Global Variables
+int nframes; // stores total number of frames
+int *is_frame_occup_struc = NULL; // pointer to free frame data struc
+int *frame_holds_what = NULL;		// array to maintain which frame holds which physical page
+char *PRAlgoToUse;				// store which page replacement algorithm to use 
+
+char *virtmem = NULL;
+char *physmem = NULL;
+struct disk *disk = NULL; // global pointer to disk
+
+
+
+// data struct for fifo
+int oldest_page = 0;
+int newest_page = 0;
+int *fifo_page_queue = NULL;
+
+
+
+// data struct for LRU
+struct page_node
 {
-    int *frames;
-    int nframes;
-    int *frame_mapping;
-    int *frame_queue;
-    int queue_front;
-    int queue_back;
-    int *ages;
-} *ft;
+	int page;
+	struct page_node *nextPage;
+}*head, *tail, *currPage, *newPage, *prevPage;
 
-struct frame_table *frame_table_create(int nframes)
+
+
+// Variables used to track statistics to print at the end
+int pageFaults = 0;
+int diskReads = 0;
+int diskWrites = 0;
+
+
+
+// function definitions
+int findnset_free_frame(int *is_frame_occup_struc,int nframes);
+void random_pra( struct page_table *pt, int page );
+void fifo_pra( struct page_table *pt, int page);
+void custom_pra( struct page_table *pt, int page);
+void replace_page( struct page_table *pt, int page, int frame_no_toremove );
+
+
+
+// function definitions for standard programs to run for testing
+void scan_program( char *data, int length );
+void sort_program( char *data, int length );
+void focus_program( char *data, int length );
+void rearrange_page_list(int i);
+static int compare_bytes( const void *pa, const void *pb );
+
+
+
+/* Some miscellaneous definitions
+	pt: pointer to page table
+	page: virtual page requested
+*/
+
+
+
+/**************** Version 1 of Page Fault Handler ***********************/
+/* This function handles the page faults generated while accessing the memory
+
+	In this version We do nothing and simply terminate program when page fault happens
+*/
+/*
+void page_fault_handler( struct page_table *pt, int page )
 {
-    struct frame_table *ft = malloc(sizeof(struct frame_table));
-    if (!ft)
+        printf("page fault on page #%d\n",page);
+        exit(1);
+}
+*/
+
+
+
+/**************** Version 2 of Page Fault Handler ***********************/
+/* This function handles the page faults generated while accessing the memory
+
+	In this version Basic Page fault handling is done assuming number of pages = number of page-frames
+*/
+/*
+void page_fault_handler( struct page_table *pt, int page )
+{
+	printf("page fault on page #%d\n",page);
+	
+	// map virtual page to physical page same as its own number
+	page_table_set_entry(pt, page, page, PROT_READ|PROT_WRITE);
+
+}
+*/
+
+
+
+/**************** Version 3 of Page Fault Handler ***********************/
+/* This function handles the page faults generated while accessing the memory
+
+	In this version the entry is first given only the read access and then is required write access is given
+*/
+/*
+void page_fault_handler( struct page_table *pt, int page )
+{
+	printf("page fault on page #%d\n",page);
+
+	
+	int bits, mapframe;
+
+	// get entry in the page table	
+	page_table_get_entry( pt, page, &mapframe, &bits );
+
+
+	// FAULT TYPE 1 - page not in virtual memory i.e. no protection bits set i.e. entry in page table is free
+	if( ((bits & PROT_READ) == 0) && ((bits & PROT_WRITE) == 0) && ((bits & PROT_EXEC) == 0) )
+	{
+		bits = bits|PROT_READ;
+		page_table_set_entry(pt, page, page, bits);
+	}
+	
+	else if( ((bits & PROT_READ) == 1) && ((bits & PROT_WRITE) == 0) ) // FAULT TYPE 2 - page in virtual memory but does not have write permission
+	{
+		bits = bits|PROT_WRITE;
+		page_table_set_entry( pt, page, mapframe, bits );
+	}
+
+
+// code for testing
+//	page_table_print(pt);
+//	printf("------------------------------------------------\n");
+
+	
+//	exit(1);
+}
+*/
+
+
+
+/**************** Version 4 of Page Fault Handler ***********************/
+/* This function handles the page faults generated while accessing the memory
+
+	In this version the entry is first given only the read access and then is required write access is given
+*/
+void page_fault_handler( struct page_table *pt, int page )
+{
+//    printf("page fault on page #%d\n",page); // print this virtual page is needed
+
+	pageFaults++;							//increment page faults
+
+	// variables to store information about the page on which page fault has occured
+    int curr_bits;
+    int curr_frame;
+    
+	// get the details of the page table entry corresponding to the page i.e. which frame does it hold and what are the permission bits
+    page_table_get_entry( pt, page, &curr_frame, &curr_bits ); 
+       
+
+    // FAULT TYPE 1 - page not in virtual memory i.e. no protection bits set i.e. entry in page table is free 
+    if ( ( (curr_bits & PROT_READ)==0 ) && ( (curr_bits & PROT_WRITE)==0 ) && ( (curr_bits & PROT_EXEC)==0 ) )
     {
-        return NULL;
+		// find a free frame
+		int free_loc = findnset_free_frame(is_frame_occup_struc, nframes);
+
+		if (free_loc != -1) // have found a free frame. Bring page in that free frame
+		{
+			// set an entry of page in page table to free_loc frame location and give read access to it
+			page_table_set_entry(pt, page, free_loc, 0|PROT_READ);
+
+			// if fifo then need to store this frame in queue 
+			if ( !strcmp(PRAlgoToUse, "fifo") )
+			{
+				fifo_page_queue[newest_page] = free_loc;
+				newest_page = (newest_page + 1) % nframes;		// make it a circular queue
+			}
+
+			// if LRU then create a new node for this page in page list
+			if ( !strcmp(PRAlgoToUse, "custom") )
+			{
+				newPage = (struct page_node *) malloc(sizeof(struct page_node));
+				newPage->page = page;
+				newPage->nextPage = NULL;
+	
+				if (head == NULL)
+				{
+					head = newPage;
+					tail = head;
+				}
+				else
+				{
+					tail->nextPage = newPage;
+					tail = newPage;
+				}
+			}
+	
+			// Read data from disk at virtual address given by 'page' to physical memory frame
+			disk_read(disk, page, &physmem[free_loc*PAGE_SIZE]);
+			diskReads++;
+
+			// Store info that this page is held in which page frame.
+			// this frame holds this page, inverse of page table.
+			frame_holds_what[free_loc] = page; 
+		}
+
+		else		// all frames all full. Need to kick out some page from some frame. Will need page replacement algorithm. Call the page replacement algorithm given by the user.
+		{ 
+			if (!strcmp(PRAlgoToUse, "rand"))
+			{
+				random_pra(pt, page);
+			}
+
+			else if (!strcmp(PRAlgoToUse, "fifo"))
+			{
+				fifo_pra(pt, page);
+			}
+			
+			else if (!strcmp(PRAlgoToUse, "custom"))
+			{
+				custom_pra(pt, page);
+			}
+
+			else //check for incorrect policy name
+			{
+				printf("use: virtmem <npages> <nframes> <rand|fifo|custom> <sort|scan|focus>\n");
+				exit(1);
+			}			
+		}
     }
 
-    ft->frames = malloc(sizeof(int) * nframes);
-    ft->frame_mapping = malloc(sizeof(int) * nframes);
-    ft->frame_queue = malloc(sizeof(int) * nframes);
-    ft->ages = malloc(sizeof(int) * nframes);
-    ft->queue_front = 0;
-    ft->queue_back = 0;
-    if (!ft->frames)
+    else // FAULT TYPE 2 - page is in virtual memory but does not have necessary permissions
     {
-        free(ft);
-        return NULL;
+		// dont have write permission but has read
+		if ( ( (curr_bits & PROT_WRITE)==0 ) && ( ( curr_bits & PROT_READ ) ==1 ) )
+		{
+			//OR curr_bits with PROC masks to get 1's at req positions.		   
+			page_table_set_entry( pt, page, curr_frame, curr_bits | PROT_WRITE);  
+		}
+
+		else // has write but not read, may happen though unlikely
+		{
+			// OR with write permission
+			page_table_set_entry( pt, page, curr_frame, curr_bits | PROT_READ);
+		}
     }
 
-    ft->nframes = nframes;
+// For testing purpose
+page_table_print(pt);
+//	page_table_print(pt);
 
-    for (int i = 0; i < nframes; i++)
+} 
+
+
+
+int main( int argc, char *argv[] )
+{
+	// check if all command line arguments are given
+	if(argc!=5) {
+		printf("use: virtmem <npages> <nframes> <rand|fifo|custom> <sort|scan|focus>\n");
+		return 1;
+	}
+
+	// derive details of the program to run from command line arguments
+	int npages = atoi(argv[1]);
+	nframes = atoi(argv[2]);		//made global
+	PRAlgoToUse = argv[3];			// store which page replacement algorithm to use 
+	const char *program = argv[4];	// store which testing program to run
+
+	
+	is_frame_occup_struc = malloc(nframes * sizeof(int)); // allocate memory for structure storing frame occupation info
+
+	if(is_frame_occup_struc == NULL) {
+		printf("Error allocating space for structure storing frame occupation information!\n");
+		exit(1);
+	}
+
+	frame_holds_what = malloc(nframes * sizeof(int));		// allocate memory for array storing which frame holds which physical page
+    
+	if(frame_holds_what == NULL) {
+		printf("Error allocating space for array storing info about which frame holds what page!\n");
+		exit(1);
+	}
+
+
+    // initialize the arrays to store frame status
+    for(int i=0; i < nframes; i++)
     {
-        ft->frames[i] = UNUSED_FRAME;
-        ft->frame_mapping[i] = UNUSED_FRAME;
-        ft->ages[i] = UNUSED_FRAME;
-        ft->frame_queue[i] = 0;
+       is_frame_occup_struc[i] = 0;  // initially no frame is occupied
+       frame_holds_what[i] = 0;  		// initially no frame holds any physical page
     }
 
-    return ft;
+
+	// for fifo
+	if ( !strcmp(PRAlgoToUse, "fifo") )
+	{
+		fifo_page_queue = malloc(nframes * sizeof(int));		// allocate memory for fifo queue
+		if(fifo_page_queue == NULL) {
+			printf("Error allocating space for fifo page queue!\n");
+			exit(1);
+		}
+	}
+
+	// for LRU, initialize pointers to page list
+	if ( !strcmp(PRAlgoToUse, "custom") )
+	{
+		head = NULL;
+		tail = NULL;
+		currPage = head;
+	}
+
+	// try to create a disk
+	disk = disk_open("myvirtualdisk", npages);
+	
+	// if 0 is returned then disk is not created. Therefore show error
+	if(!disk) {
+		fprintf(stderr,"couldn't create virtual disk: %s\n",strerror(errno));
+		return 1;
+	}
+
+	// try to cretae page table
+	struct page_table *pt = page_table_create( npages, nframes, page_fault_handler );
+	
+	// if 0 is returned then page table is not created. Therefore show error
+	if(!pt) {
+		fprintf(stderr,"couldn't create page table: %s\n",strerror(errno));
+		return 1;
+	}
+
+	// get pointer to virtual memory from the page table
+	virtmem = page_table_get_virtmem(pt);
+
+	// get pointer to physical memory from the page table
+	physmem = page_table_get_physmem(pt);
+
+
+	// run appropriate program base on the command given by the user.
+	if(!strcmp(program,"sort")) {
+		sort_program(virtmem,npages*PAGE_SIZE);
+
+	} else if(!strcmp(program,"scan")) {
+		scan_program(virtmem,npages*PAGE_SIZE);
+
+	} else if(!strcmp(program,"focus")) {
+		focus_program(virtmem,npages*PAGE_SIZE);
+
+	} else {
+		fprintf(stderr,"unknown program: %s\n",argv[3]);
+
+	}
+
+
+	//printing final state of the page table
+	printf("Final Page Table\n");
+	
+
+
+	//print results to user
+	printf("Disk Reads: %d\n", diskReads);
+	printf("Disk Writes: %d\n", diskWrites);
+	printf("Page Faults: %d\n", pageFaults);
+
+
+	// free the allocated resources
+	free(is_frame_occup_struc);
+    free(frame_holds_what);
+
+	// clean used resources
+	page_table_delete(pt);
+	disk_close(disk);
+
+	return 0;
 }
 
-void frame_table_delete(struct frame_table *ft)
+
+
+/*
+	This function implements random page replacement algorithm when a page fault occurs
+	Algorithm: A random frame is chosen from available frames for replacement and the page that it holds is replaced
+*/
+void random_pra( struct page_table *pt, int page )
 {
-    free(ft->frames);
-    free(ft->frame_mapping);
-    free(ft);
+	int frame_no_toremove= (int)lrand48()%nframes;		// select a random frame to remove
+
+	replace_page(pt, page, frame_no_toremove);
 }
 
-void frame_table_assign_frame(struct frame_table *ft, int frame, int page)
+
+
+/*
+	This function implements first in first out (fifo) page replacement algorithm when a page fault occurs
+	Algorithm: A page which came first is chosen for replacement.
+*/ 
+void fifo_pra( struct page_table *pt, int page )
 {
-    ft->frames[frame] = 1;
-    ft->frame_mapping[frame] = page;
+	int frame_no_toremove= fifo_page_queue[oldest_page];	// select first frame in the queue to replace
+
+	// NOTE here that page will be replaced only if all frames are full
+	// i.e. pointer to newest page location point actually at oldest page which is to be deleted	
+
+	// shift oldest_page to next oldest_page so that this page is removed from the queue
+	oldest_page = (oldest_page + 1) % nframes;
+	
+	replace_page(pt, page, frame_no_toremove);
+
+	// add the new page at the back of the queue and shift newest_page pointer so that it again points at the location of oldest page which is to be replaced next time.
+	fifo_page_queue[newest_page] = frame_no_toremove;
+	newest_page = (newest_page + 1) % nframes;		// make it a circular queue
 }
 
-void frame_table_free_frame(struct frame_table *ft, int frame)
+
+/*
+	This function implements Least Recently Used (LRU) page replacement algorithm when a page fault occurs
+	Algorithm: Here Linked List approach is used for implementing LRU. 
+		1. If a new page arrives and if there is space in page table, then a new entry is made for that page at the end of the linked list. 
+		2. If a page which is in linked list is referenced again, thenit is put at the end of the list.
+		3. If a new page is arrived and an old page is to be replaced, then the page at the front of the list is replaced and the new page 				is put at the back of the list.
+*/ 
+void custom_pra( struct page_table *pt, int page )
 {
-    ft->frames[frame] = UNUSED_FRAME;
-    ft->frame_mapping[frame] = UNUSED_FRAME;
+	int frame_no_toremove = head->page;			// select first page in the page list (which is least recenly used) for replacement.
+
+	// NOTE here that page will be replaced only if all entries in page table are full
+	
+	// shift oldest_page to next oldest_page so that this page is removed from the queue
+	currPage = head;
+	head = head->nextPage;
+	tail->nextPage = currPage;
+	tail = currPage;
+	currPage->nextPage = NULL;
+	
+	replace_page(pt, page, frame_no_toremove);
 }
 
-int is_frame_used(struct frame_table *ft, int frame)
+
+
+/* This function replaces the given page (according to page replacement policy) with the new page */
+void replace_page( struct page_table *pt, int page, int frame_no_toremove )
 {
-    if (ft->frames[frame] != UNUSED_FRAME)
-    {
-        return 1;
-    }
-    else
-    {
-        return 0;
-    }
+	int pageno_to_remove= frame_holds_what[frame_no_toremove]; // what page does the frame hold?
+
+	// get page table entry of that page
+	int frame_toremove; 
+	int frame_toremove_bits;
+
+	page_table_get_entry(pt, pageno_to_remove, &frame_toremove, &frame_toremove_bits ); // info from page table 
+
+
+	// if dirty i.e if it has write access, then have to write this page back in disk and then replace the page
+	if ( (frame_toremove_bits&PROT_WRITE)!=0 )
+	{
+		disk_write( disk,pageno_to_remove, &physmem[(frame_toremove)*PAGE_SIZE] ); // write back page to disk
+		diskWrites++;	
+	}
+
+	page_table_set_entry( pt, pageno_to_remove, 0, 0); // 0's invalidate frame entry of previous page
+
+	page_table_set_entry( pt, page, (frame_toremove), 0|PROT_READ ); // set new page table entry with read permission
+
+	disk_read( disk, page, &physmem[(frame_toremove)*PAGE_SIZE] ); // Read data from disk at virtual address given by 'page' to physical memory frame
+	diskReads++;
+
+
+	// Store info that this page is held in which age frame.
+	// this frame holds this page, inverse of page table.
+	frame_holds_what[(frame_toremove)] = page; // the frame now contains this page.
 }
 
-int all_frames_used(struct frame_table *ft, int nframes)
-{
-    for (int i = 0; i < nframes; i++)
-    {
-        // printf("\n%d %d\n", i, is_frame_used(ft, i));
-        if (!is_frame_used(ft, i))
-        {
 
-            return 0;
-        }
-    }
-    return 1;
+
+/*
+	This function tries to find a free frame from the available frames
+
+	INPUT: Structure storing the occupation information of all frames, total frames
+	OUTPUT: Position of free frame if a free frame is found. Otherwise -1.
+*/
+int findnset_free_frame(int *is_frame_occup_struc, int nframes)
+{
+    int i;
+    
+	for (i=0;i<nframes;i++)
+	{
+		if (is_frame_occup_struc[i] == 0) 	// if a free frame is found
+		{
+			is_frame_occup_struc[i] = 1; // mark that frame as occupied for the new incoming page 
+			return i;					// return the position of frame
+		}
+	}
+
+	// if no free frame is found, the whole page table is full, return -1
+	return -1;
 }
 
-int get_dirtypage_frame(struct page_table *pt)
-{
-    int priority = -1;
-    int no_priority = -1;
-    int nframes = page_table_get_nframes(pt);
-    for (int i = 0; i < nframes; i++)
-    {
-        int frame, bits;
-        int page = ft->frame_mapping[i];
-        page_table_get_entry(pt, page, &frame, &bits);
-        if (bits == 3 || bits == 7)
-        { // RW Permissions
-            no_priority = i;
-        }
-        else if (bits == 1 || bits == 5)
-        {
-            priority = i;
-        }
-    }
-    if (priority == -1)
-    {
-        priority = no_priority;
-    }
-    return priority;
-}
-void assign_new_frame(struct page_table *pt, int page, struct disk *disk)
-{
-    int nframes = page_table_get_nframes(pt);
-    char *physmem = page_table_get_physmem(pt);
-    int new_frame = -1;
-    for (int i = 0; i < nframes; i++)
-    {
-        if (!is_frame_used(ft, i))
-        {
-            new_frame = i;
-            break;
-        }
-    }
-    page_table_set_entry(pt, page, new_frame, PROT_READ);
-    disk_read(disk, page, &physmem[new_frame * PAGE_SIZE]);
-    disk_read_count++;
-    frame_table_assign_frame(ft, new_frame, page);
-    ft->frame_queue[ft->queue_back] = new_frame;
-    ft->queue_back = (ft->queue_back + 1) % ft->nframes;
 
-    printf("Page fault on page #%d, assigned frame #%d\n", page, new_frame);
-    page_faults_count++;
+
+/*****************************************************************************************************************************/
+/*****************************************************************************************************************************/
+/************************* Code implementing testing programs for above functional code **************************************/
+
+
+
+/* This function compares bytes and returns which one is greater 
+*/
+static int compare_bytes( const void *pa, const void *pb )
+{
+	int a = *(char*)pa;
+	int b = *(char*)pb;
+
+	if(a<b) {
+		return -1;
+	} else if(a==b) {
+		return 0;
+	} else {
+		return 1;
+	}
+
 }
 
-void assign_rand_frame(struct page_table *pt, int page, struct disk *disk)
-{
-    int nframes = page_table_get_nframes(pt);
-    char *physmem = page_table_get_physmem(pt);
-    int rand_frame = lrand48() % nframes;
-    int used_page = ft->frame_mapping[rand_frame];
-    int frame, bits;
-    page_table_get_entry(pt, used_page, &frame, &bits);
-    if (bits == 2 || bits == 3 || bits == 6 || bits == 7)
-    {
-        disk_write(disk, used_page, &physmem[rand_frame * PAGE_SIZE]);
-        disk_write_count++;
-        page_table_set_entry(pt, page, rand_frame, PROT_READ);
-        disk_read(disk, page, &physmem[frame * PAGE_SIZE]);
-        disk_read_count++;
-        page_table_set_entry(pt, used_page, 0, 0);
-        frame_table_assign_frame(ft, frame, page);
-        page_faults_count++;
-        printf("Page fault on page #%d, assigned frame #%d\n", page, rand_frame);
-    }
-    else
-    {
-        page_table_set_entry(pt, page, rand_frame, PROT_READ);
-        disk_read(disk, page, &physmem[frame * PAGE_SIZE]);
-        disk_read_count++;
 
-        page_table_set_entry(pt, used_page, 0, 0);
-        frame_table_assign_frame(ft, frame, page);
-        page_faults_count++;
-        printf("Page fault on page #%d, assigned frame #%d\n", page, rand_frame);
-    }
+
+/* Standard program having random data access */
+void focus_program( char *data, int length )
+{
+	int total=0;
+	int i,j;
+
+	srand(3829);
+
+	for(i=0;i<length;i++) {
+		data[i] = 0;		// write access to memory
+
+		// if LRU we need to re-arrange page list if the page is in the list
+		if ( !strcmp(PRAlgoToUse, "custom") )
+		{
+//			printf("page accessed: %d\n", i/PAGE_SIZE);	
+	
+			rearrange_page_list(i);
+		}
+
+	}
+
+	for(j=0;j<1000;j++) {
+		int start = rand()%length;
+		int size = 25;
+
+		for(i=0;i<1000;i++) {
+			int index = length-1-(start+rand()%(i+j+2))%length;
+			data[ index ] = rand();								// write access to memory
+				
+			// if LRU we need to re-arrange page list if the page is in the list
+			if ( !strcmp(PRAlgoToUse, "custom") )
+			{
+//				printf("page accessed: %d\n", index/PAGE_SIZE);
+
+				rearrange_page_list(index);
+			}
+		}
+	}
+
+	for(i=0;i<length;i++) {
+		total += data[i];			// read access to memory
+
+		// if LRU we need to re-arrange page list if the page is in the list
+		if ( !strcmp(PRAlgoToUse, "custom") )
+		{
+//			printf("page accessed: %d\n", i/PAGE_SIZE);
+			
+			rearrange_page_list(i);
+		}
+	}
+
+//	printf("focus result is %d\n",total);
 }
 
-void assign_queue_frame(struct page_table *pt, int page, struct disk *disk)
+
+
+/* Standard program having data access according to a sorted order */
+void sort_program( char *data, int length )
 {
-    char *physmem = page_table_get_physmem(pt);
-    int queue_frame = ft->frame_queue[ft->queue_front];
-    ft->queue_front = (ft->queue_front + 1) % ft->nframes;
-    int used_page = ft->frame_mapping[queue_frame];
-    int frame, bits;
-    page_table_get_entry(pt, used_page, &frame, &bits);
-    if (bits == 2 || bits == 3 || bits == 6 || bits == 7)
-    {
-        disk_write(disk, used_page, &physmem[queue_frame * PAGE_SIZE]);
-        disk_write_count++;
-        page_table_set_entry(pt, page, queue_frame, PROT_READ);
-        disk_read(disk, page, &physmem[frame * PAGE_SIZE]);
-        disk_read_count++;
-        page_table_set_entry(pt, used_page, 0, 0);
-        frame_table_assign_frame(ft, frame, page);
-        page_faults_count++;
-        printf("Page fault on page #%d, assigned frame #%d\n", page, queue_frame);
-    }
-    else
-    {
-        page_table_set_entry(pt, page, queue_frame, PROT_READ);
-        disk_read(disk, page, &physmem[frame * PAGE_SIZE]);
-        disk_read_count++;
-        page_table_set_entry(pt, used_page, 0, 0);
-        frame_table_assign_frame(ft, frame, page);
-        page_faults_count++;
-        printf("Page fault on page #%d, assigned frame #%d\n", page, queue_frame);
-    }
+	int total = 0;
+	int i;
+
+	srand(4856);
+
+	for(i=0;i<length;i++) {
+		data[i] = rand();
+		printf("page accessed: %d\n", i/PAGE_SIZE);
+	}
+
+	qsort(data,length,1,compare_bytes);
+
+	for(i=0;i<length;i++) {
+		total += data[i];
+		printf("page accessed: %d\n", i/PAGE_SIZE);
+	}
+
+//	printf("sort result is %d\n",total);
 }
 
-void assign_dirty_frame(struct page_table *pt, int page, struct disk *disk)
-{
-    char *physmem = page_table_get_physmem(pt);
 
-    int rand_frame = get_dirtypage_frame(pt);
-    int used_page = ft->frame_mapping[rand_frame];
-    int frame, bits;
-    page_table_get_entry(pt, used_page, &frame, &bits);
-    if (bits == 2 || bits == 3 || bits == 6 || bits == 7)
-    {
-        disk_write(disk, used_page, &physmem[rand_frame * PAGE_SIZE]);
-        disk_write_count++;
-        page_table_set_entry(pt, page, rand_frame, PROT_READ);
-        disk_read(disk, page, &physmem[frame * PAGE_SIZE]);
-        disk_read_count++;
-        page_table_set_entry(pt, used_page, 0, 0);
-        frame_table_assign_frame(ft, frame, page);
-        page_faults_count++;
-        printf("Page fault on page #%d, assigned frame #%d\n", page, rand_frame);
-    }
-    else
-    {
-        page_table_set_entry(pt, page, rand_frame, PROT_READ);
-        disk_read(disk, page, &physmem[frame * PAGE_SIZE]);
-        disk_read_count++;
-        page_table_set_entry(pt, used_page, 0, 0);
-        frame_table_assign_frame(ft, frame, page);
-        page_faults_count++;
-        printf("Page fault on page #%d, assigned frame #%d\n", page, rand_frame);
-    }
+
+/* Standard program with sequential data access */
+void scan_program( char *cdata, int length )
+{
+	unsigned i, j;
+	unsigned char *data = cdata;
+	unsigned total = 0;
+
+	for(i=0;i<length;i+=PAGE_SIZE) {
+//	for(i=0;i<length;i++) {
+		data[i] = i%256;
+
+		if ( !strcmp(PRAlgoToUse, "custom") )
+		{
+			printf("page accessed: %d\n", i/PAGE_SIZE);
+	
+			rearrange_page_list(i);
+		}
+
+	}
+
+	for(j=0;j<5;j++) {
+		for(i=0;i<length;i+=PAGE_SIZE) {
+//		for(i=0;i<length;i++) {
+			total += data[i];
+			if ( !strcmp(PRAlgoToUse, "custom") )
+			{
+				printf("page accessed: %d\n", i/PAGE_SIZE);
+				
+				rearrange_page_list(i);
+			}
+		}
+	}
+
+//	printf("scan result is %d\n",total);
 }
 
-void page_fault_handler(struct page_table *pt, int page)
+
+
+/* This function re-arranges the page list by removing existing page from the list and putting it at the tail of the list.
+	This is a requirement for LRU page Replacement algorithm 
+*/
+void rearrange_page_list(int i)
 {
-    page_table_set_entry(pt, page, page, PROT_READ | PROT_WRITE);
-    page_faults_count++;
-    printf("page fault on page #%d\n", page);
-    // exit(1);
-}
+	int page_accessed = i/PAGE_SIZE;
 
-void page_fault_handler_random(struct page_table *pt, int page)
-{
-    int nframes = page_table_get_nframes(pt);
-    int npages = page_table_get_npages(pt);
-    struct disk *disk = disk_open("myvirtualdisk", npages);
+	//check if page in list. If page not found then there is already a fault which will be handled
+	// if page found the put it at tail i.e. most recently used
 
-    int frame, bits;
-    page_table_get_entry(pt, page, &frame, &bits);
-    if (bits == 0 || bits == 4) // - || X
-    {
-        if (!all_frames_used(ft, nframes))
-        {
-            assign_new_frame(pt, page, disk);
-        }
-        else
-        {
-            assign_rand_frame(pt, page, disk);
-        }
-    }
-    else if (bits == 1 || bits == 5) // R || RX
-    {
-        page_table_set_entry(pt, page, frame, PROT_READ | PROT_WRITE);
-        page_faults_count++;
-        printf("Page fault on page #%d, modified frame #%d\n", page, frame);
-    }
-    else // 2, 3, 6, 7 (W || RW || WX || RWX)
-    {
-        printf("ye toh aa hi nahi sakta aur agar aa raha hai toh iske bits hain %d", bits);
-    }
+	prevPage = NULL;
+	currPage = head;
 
-    page_table_print(pt);
-}
+	while ( currPage != NULL )
+	{
+	
+		if (currPage->page == page_accessed)
+		{
+			// remove page and put and tail
+		
+			if (currPage != tail)
+			{
+				if(currPage != head)
+				{
+					prevPage->nextPage = currPage->nextPage;				
+					currPage->nextPage = tail->nextPage;
+					tail->nextPage = currPage;
+					tail = currPage;
+				}
+				else
+				{
+					head = head->nextPage;
+					tail->nextPage = currPage;
+					currPage->nextPage = NULL;
+				}
+			}
 
-void page_fault_handler_fifo(struct page_table *pt, int page)
-{
-    int nframes = page_table_get_nframes(pt);
-    int npages = page_table_get_npages(pt);
-    struct disk *disk = disk_open("myvirtualdisk", npages);
+			break;
+		}
 
-    int frame, bits;
-    page_table_get_entry(pt, page, &frame, &bits);
-    if (bits == 0 || bits == 4) // - || X
-    {
-        if (!all_frames_used(ft, nframes))
-        {
-            assign_new_frame(pt, page, disk);
-        }
-        else
-        {
-            assign_queue_frame(pt, page, disk);
-        }
-    }
-    else if (bits == 1 || bits == 5) // R || RX
-    {
-        page_table_set_entry(pt, page, frame, PROT_READ | PROT_WRITE);
-        page_faults_count++;
-        printf("Page fault on page #%d, modified frame #%d\n", page, frame);
-    }
-    else // 2, 3, 6, 7 (W || RW || WX || RWX)
-    {
-        printf("ye toh aa hi nahi sakta aur agar aa raha hai toh iske bits hain %d", bits);
-    }
-
-    page_table_print(pt);
-}
-
-void page_fault_handler_dirty(struct page_table *pt, int page)
-{
-    int nframes = page_table_get_nframes(pt);
-    int npages = page_table_get_npages(pt);
-    struct disk *disk = disk_open("myvirtualdisk", npages);
-
-    int frame, bits;
-    page_table_get_entry(pt, page, &frame, &bits);
-    if (bits == 0 || bits == 4) // - || X
-    {
-        if (!all_frames_used(ft, nframes))
-        {
-            assign_new_frame(pt, page, disk);
-        }
-        else
-        {
-            assign_dirty_frame(pt, page, disk);
-        }
-    }
-    else if (bits == 1 || bits == 5) // R || RX
-    {
-        page_table_set_entry(pt, page, frame, PROT_READ | PROT_WRITE);
-        page_faults_count++;
-        printf("Page fault on page #%d, modified frame #%d\n", page, frame);
-    }
-    else // 2, 3, 6, 7 (W || RW || WX || RWX)
-    {
-        printf("ye toh aa hi nahi sakta aur agar aa raha hai toh iske bits hain %d", bits);
-    }
-
-    page_table_print(pt);
-}
-
-int main(int argc, char *argv[])
-{
-    if (argc != 5)
-    {
-        printf("use: virtmem <npages> <nframes> <rand|fifo|custom> <sort|scan|focus>\n");
-        return 1;
-    }
-
-    int npages = atoi(argv[1]);
-    int nframes = atoi(argv[2]);
-    const char *algo = argv[3];
-    const char *program = argv[4];
-
-    struct disk *disk = disk_open("myvirtualdisk", npages);
-    if (!disk)
-    {
-        fprintf(stderr, "couldn't create virtual disk: %s\n", strerror(errno));
-        return 1;
-    }
-
-    ft = frame_table_create(nframes);
-    void *choose;
-    if (!strcmp(algo, "rand"))
-    {
-        choose = page_fault_handler_random;
-    }
-    else if (!strcmp(algo, "fifo"))
-    {
-        choose = page_fault_handler_fifo;
-    }
-    else if (!strcmp(algo, "custom"))
-    {
-        choose = page_fault_handler_dirty;
-    }
-    else
-    {
-        fprintf(stderr, "unknown program: %s\n", argv[3]);
-    }
-
-    struct page_table *pt = page_table_create(npages, nframes, choose);
-    if (!pt)
-    {
-        fprintf(stderr, "couldn't create page table: %s\n", strerror(errno));
-        return 1;
-    }
-
-    char *virtmem = page_table_get_virtmem(pt);
-
-    char *physmem = page_table_get_physmem(pt);
-
-    if (!strcmp(program, "sort") && (strcmp(algo, "custom")))
-    {
-        sort_program(virtmem, npages * PAGE_SIZE);
-    }
-    else if (!strcmp(program, "scan"))
-    {
-        scan_program(virtmem, npages * PAGE_SIZE);
-    }
-    else if (!strcmp(program, "focus"))
-    {
-        focus_program(virtmem, npages * PAGE_SIZE);
-    }
-    else if((!strcmp(algo, "custom")) && !(strcmp(program, "sort"))){
-        scan_program(virtmem, npages * PAGE_SIZE);
-    }
-    else
-    {
-        fprintf(stderr, "unknown program: %s\n", argv[3]);
-    }
-
-    printf("disk read: %d\n", disk_read_count);
-    printf("disk write: %d\n", disk_write_count);
-    printf("fault count: %d\n", page_faults_count);
-
-    page_table_delete(pt);
-    disk_close(disk);
-
-    return 0;
+		prevPage = currPage;
+		currPage = currPage->nextPage;
+	}
 }
